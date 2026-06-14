@@ -99,27 +99,27 @@ Full threat model in [SECURITY.md](SECURITY.md).
 
 ```bash
 # Install (stdlib only — zero dependencies)
-curl -O https://raw.githubusercontent.com/johnpippett/sigil/main/sigil.py
-chmod +x sigil.py
+curl -O https://raw.githubusercontent.com/johnpippett/sigil/main/sigil
+chmod +x sigil
 
 # Or clone
 git clone https://github.com/johnpippett/sigil.git
-cd sigil && chmod +x sigil.py
+cd sigil && chmod +x sigil
 
 # Verify a package before installing
-./sigil.py pip httpx==0.28.1
+./sigil pip httpx==0.28.1
 
 # Pipe directly to pip for enforced verification
-pip install --require-hashes -r <(./sigil.py pip httpx==0.28.1 typer==0.16.0)
+pip install --require-hashes -r <(./sigil pip httpx==0.28.1 typer==0.16.0)
 
 # Cargo
-./sigil.py cargo ripgrep==14.1.1
+./sigil cargo ripgrep==14.1.1
 
 # RubyGems
-./sigil.py gem rake==13.2.1
+./sigil gem rake==13.2.1
 
 # npm (verify before npx-style execution)
-./sigil.py npm cowsay@1.6.0
+./sigil npm cowsay@1.6.0
 ```
 
 ## Hermes Agent Integration
@@ -129,7 +129,7 @@ Sigil ships as a skill for [Hermes Agent](https://github.com/NousResearch/hermes
 ```bash
 # Install the skill
 cp SKILL.md ~/.hermes/skills/software-development/sigil/SKILL.md
-cp sigil.py ~/.hermes/skills/software-development/sigil/scripts/pkg-hash-resolve
+cp sigil ~/.hermes/skills/software-development/sigil/scripts/pkg-hash-resolve
 ```
 
 ## Philosophy
