@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+"""
+Multi-registry package hash resolver. Cache-first with TTL freshness, schema
+validation, input sanitization, and graceful degradation when registries are
+unreachable.
+
+Registries: pip (PyPI), cargo (crates.io), gem (RubyGems), npm (registry.npmjs.org)
+
+Cache entries include timestamps. TTL defaults to 24h — after that, the script
+re-verifies from the registry API. If the API is down, it falls back to the
+stale cached hash with a warning. If the API response schema changes, it falls
+back to cache (if available) and warns. Only hard-blocks when no hash exists
+anywhere (no cache, API failed, no fallback).
+
+Usage:
+  pkg-hash-resolve pip httpx==0.28.1 typer==0.16.0
+  pkg-hash-resolve cargo ripgrep==14.1.1
+  pkg-hash-resolve gem rake==13.2.1
+  pkg-hash-resolve npm cowsay@1.6.0
+
+Output: one line per package, format depends on registry:
+  pip:   PACKAGE==VERSION --hash=sha256:HASH
+  cargo: PACKAGE==VERSION sha256:HASH
+  gem:   PACKAGE==VERSION sha256:HASH
+  npm:   PACKAGE@VERSION integrity:HASH
+"""
+import json
+import os as _os
+import re
+import sys
+import tempfile
+import time
+from pathlib import Path
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+CACHE_DIR = Path.home() / ".cache" / "hermes"
+TTL_SECONDS = 24 * 3600  # 24 hours
+TIMEOUT = 5
+UA = "hermes-pkg-verify/4.0"
+
+# ── Validation ──────────────────────────────────────────────────────────────
+
+# Control characters / whitespace — reject in any user-facing string
+_RE_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\s]")
+
+# Hash format validators
+_HASH_VALIDATORS = {
+    "pip":   re.compile(r"^[0-9a-f]{64}$"),          # SHA256 hex
+    "cargo": re.compile(r"^[0-9a-f]{64}$"),          # SHA256 hex
+    "gem":   re.compile(r"^[0-9a-f]{64}$"),          # SHA256 hex
+    "npm":   re.compile(r"^sha(512|256|1|384)-[A-Za-z0-9+/=]+$"),  # subresource integrity
+}
+
+def validate_identifier(val, label="value"):
+    """Reject strings with control characters or whitespace. Used for names,
+    versions, and any field that ends up in output lines."""
+    if not val or not isinstance(val, str):
+        return False
+    if _RE_CONTROL.search(val):
+        return False
+    return True
+
+def validate_hash(reg_name, hash_val):
+    """Validate hash format. Returns True if safe, False if potentially malicious."""
+    if not hash_val or not isinstance(hash_val, str):
+        return False
+    if _RE_CONTROL.search(hash_val):
+        return False
+    validator = _HASH_VALIDATORS.get(reg_name)
+    if validator and not validator.match(hash_val):
+        return False
+    return True
+
+# ── Registry-specific hash extractors ───────────────────────────────────────
+
+def _extract_pip_hash(info):
+    """Prefer pure wheel, then any wheel, then sdist."""
+    urls = info.get("urls", [])
+    if not urls:
+        return None
+    wheels = [u for u in urls if u.get("packagetype") == "bdist_wheel"]
+    pure = [w for w in wheels if "py3-none-any" in w.get("filename", "")]
+    candidates = pure or wheels or urls
+    return _extract_nested(candidates[0], ["digests", "sha256"])
+
+def _extract_cargo_hash(info):
+    return _extract_nested(info, ["version", "checksum"])
+
+def _extract_gem_hash(info):
+    return _extract_nested(info, ["sha"])
+
+def _extract_npm_hash(info):
+    return _extract_nested(info, ["dist", "integrity"])
+
+# ── Registry definitions ────────────────────────────────────────────────────
+
+REGISTRIES = {
+    "pip": {
+        "cache_file": "pkg-hashes.json",
+        "sep": "==",
+        "out_fmt": "{name}=={ver} --hash=sha256:{hash}",
+        "api_url": "https://pypi.org/pypi/{name}/{ver}/json",
+        "latest_url": "https://pypi.org/pypi/{name}/json",
+        "latest_path": ["info", "version"],
+        "extract_hash": _extract_pip_hash,
+        # Strip extras: httpx[brotli]==0.28.1 → httpx for API lookup
+        "clean_name": lambda n: re.sub(r'\[.*\]$', '', n),
+    },
+    "cargo": {
+        "cache_file": "crate-hashes.json",
+        "sep": "==",
+        "out_fmt": "{name}=={ver}  sha256:{hash}",
+        "api_url": "https://crates.io/api/v1/crates/{name}/{ver}",
+        "latest_url": "https://crates.io/api/v1/crates/{name}",
+        "latest_path": ["crate", "max_stable_version"],
+        "extract_hash": _extract_cargo_hash,
+    },
+    "gem": {
+        "cache_file": "gem-hashes.json",
+        "sep": "==",
+        "out_fmt": "{name}=={ver}  sha256:{hash}",
+        "api_url": "https://rubygems.org/api/v1/gems/{name}.json",
+        "latest_url": "https://rubygems.org/api/v1/gems/{name}.json",
+        "latest_path": ["version"],
+        "extract_hash": _extract_gem_hash,
+    },
+    "npm": {
+        "cache_file": "npm-hashes.json",
+        "sep": "@",
+        "out_fmt": "{name}@{ver}  integrity:{hash}",
+        "api_url": "https://registry.npmjs.org/{name}/{ver}",
+        "latest_url": "https://registry.npmjs.org/{name}/latest",
+        "latest_path": ["version"],
+        "extract_hash": _extract_npm_hash,
+    },
+}
+
+# ── NPM package name parsing (handles scoped: @scope/name@ver) ───────────────
+
+def _parse_npm_spec(spec):
+    """Parse an npm package spec into (name, version_or_none).
+    Handles scoped packages: @angular/core@17.0.0 → ('@angular/core', '17.0.0')
+    """
+    if "@" not in spec:
+        return spec, None
+    if spec.startswith("@"):
+        # Scoped: @scope/name or @scope/name@version
+        # Find the second @ (version separator)
+        rest = spec[1:]  # strip leading @
+        if "/" not in rest:
+            return spec, None  # malformed, treat as-is
+        scope_name, _, remainder = rest.partition("/")
+        scope = f"@{scope_name}/{remainder}" if "@" not in remainder else None
+        if scope is None:
+            # remainder contains @: "name@version"
+            name_part, _, ver = remainder.partition("@")
+            return f"@{scope_name}/{name_part}", ver or None
+        else:
+            return spec, None
+    else:
+        # Unscoped: name or name@version
+        name, _, ver = spec.partition("@")
+        return name, ver or None
+
+# ── Cache I/O ────────────────────────────────────────────────────────────────
+
+def load_cache(reg_name):
+    cache_file = CACHE_DIR / REGISTRIES[reg_name]["cache_file"]
+    if cache_file.exists():
+        try:
+            return json.loads(cache_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+def save_cache(reg_name, cache):
+    """Atomic write via temp file + rename."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.chmod(0o700)
+    cache_file = CACHE_DIR / REGISTRIES[reg_name]["cache_file"]
+    tmp = tempfile.NamedTemporaryFile(
+        mode='w', dir=CACHE_DIR, delete=False,
+        prefix=cache_file.name + '.', suffix='.tmp'
+    )
+    try:
+        json.dump(cache, tmp, indent=2, sort_keys=True)
+        tmp.flush()
+        _os.fsync(tmp.fileno())
+        tmp.close()
+        _os.chmod(tmp.name, 0o600)
+        _os.replace(tmp.name, cache_file)
+    except Exception:
+        try:
+            _os.unlink(tmp.name)
+        except OSError:
+            pass
+        raise
+
+# ── API helpers ─────────────────────────────────────────────────────────────
+
+def fetch_json(url):
+    """Fetch and parse JSON. Returns None on any failure."""
+    try:
+        req = Request(url, headers={"User-Agent": UA})
+        with urlopen(req, timeout=TIMEOUT) as r:
+            return json.loads(r.read())
+    except (URLError, HTTPError, json.JSONDecodeError, OSError) as e:
+        print(f"[WARN] API unreachable: {url} ({e})", file=sys.stderr)
+        return None
+
+def _extract_nested(data, path):
+    """Walk a path of dict keys. Returns None if any step fails."""
+    current = data
+    for step in path:
+        try:
+            current = current[step]
+        except (KeyError, IndexError, TypeError):
+            return None
+    return current if current else None
+
+# ── Core logic ──────────────────────────────────────────────────────────────
+
+def resolve_hash(reg_name, name, ver, cache):
+    """Resolve a hash. Returns (hash_value, source)."""
+    reg = REGISTRIES[reg_name]
+    key = f"{name}{reg['sep']}{ver}"
+    now = time.time()
+    stale_hash = None
+
+    # Sanitize name and version (defense-in-depth)
+    if not validate_identifier(name, "package name"):
+        print(f"[SECURITY] Rejected package name for {key} — contains control characters", file=sys.stderr)
+        return None, None
+    if not validate_identifier(ver, "version"):
+        print(f"[SECURITY] Rejected version for {key} — contains control characters", file=sys.stderr)
+        return None, None
+
+    # Check cache
+    if key in cache:
+        entry = cache[key]
+        if isinstance(entry, dict) and "hash" in entry:
+            age = now - entry.get("ts", 0)
+            if age < TTL_SECONDS:
+                if validate_hash(reg_name, entry["hash"]):
+                    return entry["hash"], "cache-fresh"
+                else:
+                    print(f"[SECURITY] Cached hash for {key} failed validation — purging", file=sys.stderr)
+                    del cache[key]
+            else:
+                # Stale — keep as fallback, but try to refresh
+                if validate_hash(reg_name, entry["hash"]):
+                    stale_hash = entry["hash"]
+                else:
+                    print(f"[SECURITY] Stale cached hash for {key} failed validation — purging", file=sys.stderr)
+                    del cache[key]
+        elif isinstance(entry, str):
+            # Legacy cache format
+            if validate_hash(reg_name, entry):
+                stale_hash = entry
+                cache[key] = {"hash": stale_hash, "ts": 0}
+            else:
+                del cache[key]
+
+    # Try API
+    api_url = reg["api_url"].format(name=name, ver=ver)
+    info = fetch_json(api_url)
+
+    if info is not None:
+        hash_val = reg["extract_hash"](info)
+        if hash_val and validate_hash(reg_name, hash_val):
+            cache[key] = {"hash": hash_val, "ts": now}
+            return hash_val, "api"
+
+        if hash_val:
+            # Hash found but failed validation — registry may be compromised
+            print(f"[SECURITY] Rejected hash for {key} — failed format validation", file=sys.stderr)
+        else:
+            # Hash not found — schema may have changed
+            print(f"[WARN] API response for {key} did not contain expected hash field", file=sys.stderr)
+
+        # Fall back to cached hash if available and still valid
+        if stale_hash and validate_hash(reg_name, stale_hash):
+            return stale_hash, "cache-fallback"
+
+    # API failed — use stale cache if available and valid
+    if stale_hash and validate_hash(reg_name, stale_hash):
+        age = int(now - cache[key].get("ts", 0)) if key in cache else 0
+        print(f"[WARN] Using {age}s old cached hash for {key} (API unreachable)", file=sys.stderr)
+        return stale_hash, "cache-stale"
+
+    return None, None
+
+
+def resolve_latest(reg_name, name):
+    """Resolve latest version from registry. Returns version string or None.
+    Validates the returned version for control characters."""
+    reg = REGISTRIES[reg_name]
+    url = reg["latest_url"].format(name=name)
+    info = fetch_json(url)
+    if info is None:
+        return None
+    ver = _extract_nested(info, reg["latest_path"])
+    if ver is None and reg_name == "cargo":
+        ver = _extract_nested(info, ["crate", "newest_version"])
+    if ver is not None and not validate_identifier(ver, "version"):
+        print(f"[SECURITY] Rejected version '{ver}' for {name} — contains control characters", file=sys.stderr)
+        return None
+    return ver
+
+
+def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "--version":
+        print("sigil 4.0.0", file=sys.stderr)
+        sys.exit(0)
+
+    if len(sys.argv) < 3 or sys.argv[1] in ("-h", "--help"):
+        print("Usage: pkg-hash-resolve REGISTRY PACKAGE[SEP VERSION] ...", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Registries: pip, cargo, gem, npm", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Examples:", file=sys.stderr)
+        print("  pkg-hash-resolve pip httpx==0.28.1 typer==0.16.0", file=sys.stderr)
+        print("  pkg-hash-resolve cargo ripgrep==14.1.1", file=sys.stderr)
+        print("  pkg-hash-resolve gem rake==13.2.1", file=sys.stderr)
+        print("  pkg-hash-resolve npm cowsay@1.6.0", file=sys.stderr)
+        print("  pkg-hash-resolve npm @angular/core@17.0.0", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(f"Cache: {CACHE_DIR}/<registry>-hashes.json", file=sys.stderr)
+        print(f"TTL:   {TTL_SECONDS // 3600}h", file=sys.stderr)
+        sys.exit(0)
+
+    reg_name = sys.argv[1]
+    if reg_name not in REGISTRIES:
+        print(f"[ERROR] Unknown registry: {reg_name}. Use: pip, cargo, gem, npm", file=sys.stderr)
+        sys.exit(1)
+
+    reg = REGISTRIES[reg_name]
+    cache = load_cache(reg_name)
+    specs = sys.argv[2:]
+
+    # Resolve packages → (name, version)
+    pinned = []
+    for spec in specs:
+        if reg_name == "npm":
+            name, ver = _parse_npm_spec(spec)
+        else:
+            sep = reg["sep"]
+            if sep in spec:
+                parts = spec.split(sep, 1)
+                name, ver = parts[0], parts[1]
+            else:
+                name, ver = spec, None
+
+        # Strip extras from pip package names (httpx[brotli] → httpx)
+        cleaner = reg.get("clean_name")
+        if cleaner:
+            name = cleaner(name)
+
+        # Validate user-provided values
+        if not validate_identifier(name, "package name"):
+            print(f"[SECURITY] Rejected package name '{name}' — contains control characters", file=sys.stderr)
+            sys.exit(1)
+
+        if ver is None:
+            ver = resolve_latest(reg_name, name)
+            if ver is None:
+                print(f"[ERROR] Cannot resolve latest version for {name}", file=sys.stderr)
+                sys.exit(1)
+            print(f"[INFO] {name} → {ver}", file=sys.stderr)
+        elif not validate_identifier(ver, "version"):
+            print(f"[SECURITY] Rejected version '{ver}' for {name} — contains control characters", file=sys.stderr)
+            sys.exit(1)
+
+        pinned.append((name, ver))
+
+    # Resolve hashes
+    needs_api = []
+    result_map = {}
+    stats = {"cache-fresh": 0, "cache-stale": 0, "api": 0, "cache-fallback": 0}
+
+    for name, ver in pinned:
+        hash_val, source = resolve_hash(reg_name, name, ver, cache)
+        if hash_val is not None:
+            result_map[f"{name}{reg['sep']}{ver}"] = hash_val
+            if source:
+                stats[source] = stats.get(source, 0) + 1
+        else:
+            needs_api.append((name, ver))
+
+    # Second pass: parallel API for any still-unresolved
+    unresolved = []
+    for name, ver in needs_api:
+        key = f"{name}{reg['sep']}{ver}"
+        if key not in result_map:
+            unresolved.append((name, ver))
+
+    if unresolved:
+        with ThreadPoolExecutor(max_workers=min(8, len(unresolved))) as ex:
+            futs = {}
+            for name, ver in unresolved:
+                api_url = reg["api_url"].format(name=name, ver=ver)
+                futs[ex.submit(fetch_json, api_url)] = (name, ver)
+
+            for fut in as_completed(futs):
+                name, ver = futs[fut]
+                key = f"{name}{reg['sep']}{ver}"
+                info = fut.result()
+                if info is not None:
+                    hash_val = reg["extract_hash"](info)
+                    if hash_val and validate_hash(reg_name, hash_val):
+                        cache[key] = {"hash": hash_val, "ts": time.time()}
+                        result_map[key] = hash_val
+                        stats["api"] += 1
+                        continue
+                print(f"[ERROR] Cannot resolve hash for {key} — no cache, API failed", file=sys.stderr)
+                sys.exit(1)
+
+    # Output
+    for name, ver in pinned:
+        key = f"{name}{reg['sep']}{ver}"
+        h = result_map[key]
+        print(reg["out_fmt"].format(name=name, ver=ver, hash=h))
+
+    save_cache(reg_name, cache)
+
+    summary = ", ".join(f"{v} {k}" for k, v in stats.items() if v)
+    print(f"[DONE] {summary}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
