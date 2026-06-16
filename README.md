@@ -1,4 +1,5 @@
-```
+<div align="center">
+<pre>
   ███████╗ ██╗  ██████╗ ██╗ ██╗
   ██╔════╝ ██║ ██╔════╝ ██║ ██║
   ███████╗ ██║ ██║  ███╗██║ ██║
@@ -8,7 +9,8 @@
 
        seal your dependencies
        never install blind
-```
+</pre>
+</div>
 
 ---
 
@@ -36,28 +38,28 @@ This is not a joke. This is how supply chain attacks happen.
 ## How Sigil Works
 
 ```
-  User                  Sigil                    Registry              Package Manager
-  ────                  ─────                    ────────              ───────────────
+  User                  Sigil                    Registry              Package Mgr
+  ────                  ─────                    ────────              ───────────
     │                     │                         │                       │
-    │  install pkg==1.0   │                         │                       │
+    │ install pkg==1.0    │                         │                       │
     │────────────────────>│                         │                       │
     │                     │                         │                       │
-    │                     │  GET /pkg/1.0/json       │                       │
+    │                     │ GET /pkg/1.0/json       │                       │
     │                     │────────────────────────>│                       │
     │                     │                         │                       │
-    │                     │  {sha256: "abc123..."}   │                       │
+    │                     │                         │ {sha256: "abc123..."} │
     │                     │<────────────────────────│                       │
     │                     │                         │                       │
-    │                     │  validate hash format    │                       │
-    │                     │  cache with 24h TTL      │                       │
+    │                     │ validate hash format    │                       │
+    │                     │ cache with 24h TTL      │                       │
     │                     │                         │                       │
-    │                     │  pip install --require-hashes ...              │
-    │                     │─────────────────────────────────────────────>│
+    │                     │ pip install --require-hashes ...                │
+    │                     │────────────────────────────────────────────────>│
     │                     │                         │                       │
     │                     │         ✓ verified      │                       │
-    │                     │<─────────────────────────────────────────────│
+    │                     │<────────────────────────────────────────────────│
     │                     │                         │                       │
-    │  ✓ installed        │                         │                       │
+    │ ✓ installed         │                         │                       │
     │<────────────────────│                         │                       │
 ```
 
